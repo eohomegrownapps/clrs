@@ -19,7 +19,7 @@ import functools
 import os
 import pickle
 
-from typing import Dict, Tuple, List
+from typing import Callable, Dict, Tuple, List
 
 import chex
 
@@ -76,10 +76,11 @@ class Net(hk.Module):
       encode_hints: bool,
       decode_hints: bool,
       decode_diffs: bool,
-      kind: str,
       inf_bias: bool,
       inf_bias_edge: bool,
       nb_dims=None,
+      kind: str = None,
+      processor: Callable[..., processors.Processor] = None,
       name: str = 'net',
   ):
     """Constructs a `Net`."""
@@ -93,7 +94,11 @@ class Net(hk.Module):
     self.decode_hints = decode_hints
     self.decode_diffs = decode_diffs
     self.kind = kind
+    self.processor = processor
     self.nb_dims = nb_dims
+    
+    if self.kind is None:
+      assert self.processor is not None
 
   def _msg_passing_step(self,
                         mp_state: _MessagePassingScanState,
@@ -350,7 +355,10 @@ class Net(hk.Module):
 
   def _construct_processor(self):
     """Constructs processor."""
-    if self.kind in ['deepsets', 'mpnn', 'pgn']:
+    if self.kind is None:
+      assert self.processor is not None
+      self.mpnn = self.processor()
+    elif self.kind in ['deepsets', 'mpnn', 'pgn']:
       self.mpnn = processors.MPNN(
           out_size=self.hidden_dim,
           mid_act=jax.nn.relu,
@@ -452,9 +460,11 @@ class Net(hk.Module):
         else:
           raise ValueError('Invalid hint location')
 
-    if self.kind == 'deepsets':
+    if self.kind is None:
+      adj_mat = self.mpnn.preprocess_adjmat(adj_mat)
+    elif self.kind == 'deepsets':
       adj_mat = jnp.repeat(
-          jnp.expand_dims(jnp.eye(nb_nodes), 0), self.batch_size, axis=0)
+          jnp.expand_dims(jnp.eye(adj_mat.shape[1]), 0), adj_mat.shape[0], axis=0)
     elif self.kind == 'mpnn' or self.kind == 'gat':
       adj_mat = jnp.ones_like(adj_mat)
     elif self.kind == 'pgn':
@@ -616,11 +626,29 @@ class Net(hk.Module):
 class BaselineModel(model.Model):
   """Model implementation with selectable message passing algorithm."""
 
+  @staticmethod
+  def from_params(model_params, data_params, training_params, checkpoint_path, spec, dummy_trajectory) -> "BaselineModel":
+    return BaselineModel(
+      spec=spec,
+      hidden_dim=model_params["hidden_dim"],
+      encode_hints=data_params["encode_hints"],
+      decode_hints=data_params["decode_hints"],
+      decode_diffs=data_params["decode_diffs"],
+      processor=lambda: model_params["processor"].from_model_params(model_params),
+      learning_rate=training_params["learning_rate"],
+      checkpoint_path=checkpoint_path,
+      freeze_processor=training_params["freeze_processor"],
+      dummy_trajectory=dummy_trajectory,
+      pgn_mask=model_params["pgn_mask"] if "pgn_mask" in model_params else False
+    )
+
   def __init__(
       self,
       spec,
       hidden_dim=32,
       kind='mpnn',
+      processor=None,
+      pgn_mask=False,
       encode_hints=False,
       decode_hints=True,
       decode_diffs=False,
@@ -643,7 +671,10 @@ class BaselineModel(model.Model):
     self._freeze_processor = freeze_processor
     self.opt = optax.adam(learning_rate)
 
-    if kind == 'pgn_mask':
+    if kind is None:
+      assert processor is not None
+    
+    if kind == 'pgn_mask' or pgn_mask:
       inf_bias = True
       inf_bias_edge = True
       kind = 'pgn'
@@ -660,8 +691,8 @@ class BaselineModel(model.Model):
       self.nb_dims[outp.name] = outp.data.shape[-1]
 
     def _use_net(*args, **kwargs):
-      return Net(spec, hidden_dim, encode_hints, decode_hints, decode_diffs,
-                 kind, inf_bias, inf_bias_edge, self.nb_dims)(*args, **kwargs)
+      return Net(spec, hidden_dim, encode_hints, decode_hints, decode_diffs, 
+                 inf_bias, inf_bias_edge, self.nb_dims, kind=kind)(*args, **kwargs)
 
     self.net_fn = hk.without_apply_rng(hk.transform(_use_net))
     self.net_fn_apply = jax.jit(self.net_fn.apply, static_argnums=2)

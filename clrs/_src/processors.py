@@ -15,7 +15,9 @@
 
 """JAX implementation of baseline processor networks."""
 
-from typing import Any, Callable, List, Optional
+import abc
+from os import stat
+from typing import Any, Callable, Dict, List, Optional
 
 import chex
 import haiku as hk
@@ -26,8 +28,53 @@ import jax.numpy as jnp
 _Array = chex.Array
 _Fn = Callable[..., Any]
 
+class Processor(hk.Module, abc.ABC):
+  @abc.abstractmethod
+  def __call__(
+      self,
+      features: _Array,
+      e_features: _Array,
+      g_features: _Array,
+      adj: _Array,
+  ) -> _Array:
+    """Processor inference step.
 
-class GAT(hk.Module):
+    Args:
+      features: Node features.
+      e_features: Edge features.
+      g_features: Graph features.
+      adj: Graph adjacency matrix.
+
+    Returns:
+      Output of processor inference step.
+    """
+    pass
+  
+  @abc.abstractmethod
+  def preprocess_adjmat(
+      self,
+      adj_mat: _Array,
+  ) -> _Array:
+    """Preprocess adjacency matrix given in problem specification for use in model
+
+    Args:
+      adj_mat: Problem adjacency matrix (shape [B,N,N])
+
+    Returns:
+      Adjaacency matrix for input to the processor network (shape [B,N,N])
+    
+    Shape:
+      B: batch size
+      N: number of nodes
+    """
+    pass
+  
+  @staticmethod
+  def from_model_params(model_params: Dict[str, Any]) -> "Processor":
+    """Return an instance of the model instantiated with model parameters."""
+    pass
+
+class GAT(Processor):
   """Graph Attention Network (Velickovic et al., ICLR 2018)."""
 
   def __init__(
@@ -98,8 +145,19 @@ class GAT(hk.Module):
 
     return ret
 
+  def preprocess_adjmat(self, adj_mat: _Array) -> _Array:
+      return jnp.ones_like(adj_mat)
 
-class MPNN(hk.Module):
+  @staticmethod
+  def from_model_params(model_params: Dict[str, Any]) -> "Processor":
+      return GAT(
+        out_size=model_params["out_size"],
+        nb_heads=model_params["nb_heads"],
+        activation=model_params["activation"],
+        residual=model_params["residual"],
+      )
+    
+class MPNN(Processor):
   """Message-Passing Neural Network (Gilmer et al., ICML 2017)."""
 
   def __init__(
@@ -183,3 +241,53 @@ class MPNN(hk.Module):
       ret = self.activation(ret)
 
     return ret
+
+  def preprocess_adjmat(self, adj_mat: _Array) -> _Array:
+      return jnp.ones_like(adj_mat)
+  
+  @staticmethod
+  def from_model_params(model_params: Dict[str, Any]) -> "Processor":
+      return MPNN(
+        out_size=model_params["out_size"],
+        mid_act=model_params["mid_act"],
+        activation=model_params["activation"],
+        reduction=model_params["reduction"],
+        msgs_mlp_sizes=model_params["msgs_mlp_sizes"],
+      )
+
+class PGN(MPNN):
+  """Pointer Graph Network (Velickovic et al., NeurIPS 2020)."""
+  def __init__(self, *args, **kwargs):
+      self.pgn_mask = kwargs["pgn_mask"]
+      del kwargs["pgn_mask"]
+      super().__init__(*args, **kwargs)
+  
+  def preprocess_adjmat(self, adj_mat: _Array) -> _Array:
+      return (adj_mat > 0.0) * 1.0
+  
+  @staticmethod
+  def from_model_params(model_params: Dict[str, Any]) -> "Processor":
+      return PGN(
+        out_size=model_params["out_size"],
+        mid_act=model_params["mid_act"],
+        activation=model_params["activation"],
+        reduction=model_params["reduction"],
+        msgs_mlp_sizes=model_params["msgs_mlp_sizes"],
+        pgn_mask=model_params["pgn_mask"]
+      )
+
+class DeepSets(MPNN):
+  """Deep Sets (Zaheer et al., NeurIPS 2017)."""
+  def preprocess_adjmat(self, adj_mat: _Array) -> _Array:
+      return jnp.repeat(
+          jnp.expand_dims(jnp.eye(adj_mat.shape[1]), 0), adj_mat.shape[0], axis=0)
+  
+  @staticmethod
+  def from_model_params(model_params: Dict[str, Any]) -> "Processor":
+      return DeepSets(
+        out_size=model_params["out_size"],
+        mid_act=model_params["mid_act"],
+        activation=model_params["activation"],
+        reduction=model_params["reduction"],
+        msgs_mlp_sizes=model_params["msgs_mlp_sizes"],
+      )
