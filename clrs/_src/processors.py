@@ -32,18 +32,22 @@ class Processor(hk.Module, abc.ABC):
   @abc.abstractmethod
   def __call__(
       self,
-      features: _Array,
+      hidden: _Array,
+      n_features: _Array,
       e_features: _Array,
       g_features: _Array,
       adj: _Array,
+      first_step: bool
   ) -> _Array:
     """Processor inference step.
 
     Args:
-      features: Node features.
+      hidden: Node hidden state (zero if first step).
+      n_features: Node features.
       e_features: Edge features.
       g_features: Graph features.
       adj: Graph adjacency matrix.
+      first_step: Whether this is the first inference step.
 
     Returns:
       Output of processor inference step.
@@ -93,10 +97,12 @@ class GAT(Processor):
 
   def __call__(
       self,
-      features: _Array,
+      hidden: _Array,
+      n_features: _Array,
       e_features: _Array,
       g_features: _Array,
       adj: _Array,
+      first_step: bool,
   ) -> _Array:
     """GAT inference step.
 
@@ -109,6 +115,7 @@ class GAT(Processor):
     Returns:
       Output of GAT inference step.
     """
+    features = jnp.concatenate([n_features, hidden], axis=-1)
     b, n, _ = features.shape
     assert e_features.shape[:-1] == (b, n, n)
     assert g_features.shape[:-1] == (b,)
@@ -183,10 +190,12 @@ class MPNN(Processor):
 
   def __call__(
       self,
-      features: _Array,
+      hidden: _Array,
+      n_features: _Array,
       e_features: _Array,
       g_features: _Array,
       adj: _Array,
+      first_step: bool,
   ) -> _Array:
     """MPNN inference step.
 
@@ -199,6 +208,7 @@ class MPNN(Processor):
     Returns:
       Output of MPNN inference step.
     """
+    features = jnp.concatenate([n_features, hidden], axis=-1)
     b, n, _ = features.shape
     assert e_features.shape[:-1] == (b, n, n)
     assert g_features.shape[:-1] == (b,)

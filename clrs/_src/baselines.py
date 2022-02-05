@@ -141,7 +141,7 @@ class Net(hk.Module):
         gt_diffs[loc] = (gt_diffs[loc] > 0.0).astype(jnp.float32) * 1.0
 
     hiddens, output_preds_cand, hint_preds, diff_logits = self._one_step_pred(
-        inputs, cur_hint, mp_state.hiddens, nb_nodes)
+        inputs, cur_hint, mp_state.hiddens, nb_nodes, first_step)
 
     if first_step:
       output_preds = output_preds_cand
@@ -381,6 +381,7 @@ class Net(hk.Module):
       hints: _Trajectory,
       hidden: _Array,
       nb_nodes: int,
+      first_step: bool,
   ):
     """Generates one step predictions."""
 
@@ -473,8 +474,8 @@ class Net(hk.Module):
       raise ValueError('Unsupported kind of model')
 
     z = jnp.concatenate([node_fts, hidden], axis=-1)
-    nxt_hidden = self.mpnn(z, edge_fts, graph_fts,
-                           (adj_mat > 0.0).astype('float32'))
+    nxt_hidden = self.mpnn(hidden, node_fts, edge_fts, graph_fts,
+                           (adj_mat > 0.0).astype('float32'), first_step)
     h_t = jnp.concatenate([z, nxt_hidden], axis=-1)
 
     hint_preds = {}
