@@ -109,7 +109,7 @@ class Net(hk.Module):
                         nb_nodes: int,
                         inputs: _Trajectory,
                         first_step: bool = False):
-    if (not first_step) and repred and self.decode_hints:
+    if (not first_step) and repred: #and self.decode_hints:
       decoded_hint = _decode_from_preds(self.spec, mp_state.hint_preds)
       cur_hint = []
       for hint in decoded_hint:
@@ -630,6 +630,7 @@ class BaselineModel(model.Model):
   @staticmethod
   def from_params(model_params, data_params, training_params, checkpoint_path, spec, dummy_trajectory) -> "BaselineModel":
     return BaselineModel(
+      kind=None,
       spec=spec,
       hidden_dim=model_params["hidden_dim"],
       encode_hints=data_params["encode_hints"],
@@ -693,7 +694,7 @@ class BaselineModel(model.Model):
 
     def _use_net(*args, **kwargs):
       return Net(spec, hidden_dim, encode_hints, decode_hints, decode_diffs, 
-                 inf_bias, inf_bias_edge, self.nb_dims, kind=kind)(*args, **kwargs)
+                 inf_bias, inf_bias_edge, self.nb_dims, kind=kind, processor=processor)(*args, **kwargs)
 
     self.net_fn = hk.without_apply_rng(hk.transform(_use_net))
     self.net_fn_apply = jax.jit(self.net_fn.apply, static_argnums=2)
