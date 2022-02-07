@@ -19,10 +19,13 @@ import functools
 import os
 import pickle
 
-from typing import Callable, Dict, Tuple, List
+from typing import Callable, Dict, Tuple, List, Optional
 
 import chex
 
+from clrs._src import decoders
+from clrs._src import encoders
+from clrs._src import losses
 from clrs._src import model
 from clrs._src import probing
 from clrs._src import processors
@@ -34,8 +37,6 @@ import jax
 import jax.numpy as jnp
 import optax
 
-
-_BIG_NUMBER = 1e5
 
 _Array = chex.Array
 _DataPoint = probing.DataPoint
@@ -50,13 +51,6 @@ _Type = specs.Type
 _OutputClass = specs.OutputClass
 
 
-def _is_not_done_broadcast(lengths, i, tensor):
-  is_not_done = (lengths > i + 1) * 1.0
-  while len(is_not_done.shape) < len(tensor.shape):
-    is_not_done = jnp.expand_dims(is_not_done, -1)
-  return is_not_done
-
-
 @chex.dataclass
 class _MessagePassingScanState:
   hint_preds: chex.Array
@@ -64,6 +58,7 @@ class _MessagePassingScanState:
   gt_diffs: chex.Array
   output_preds: chex.Array
   hiddens: chex.Array
+  lstm_state: Optional[hk.LSTMState]
 
 
 class Net(hk.Module):
@@ -78,6 +73,8 @@ class Net(hk.Module):
       decode_diffs: bool,
       inf_bias: bool,
       inf_bias_edge: bool,
+      use_lstm: bool,
+      dropout_prob: float,
       nb_dims=None,
       kind: str = None,
       processor: Callable[..., processors.Processor] = None,
@@ -86,6 +83,7 @@ class Net(hk.Module):
     """Constructs a `Net`."""
     super().__init__(name=name)
 
+    self._dropout_prob = dropout_prob
     self.spec = spec
     self.inf_bias = inf_bias
     self.inf_bias_edge = inf_bias_edge
@@ -99,6 +97,7 @@ class Net(hk.Module):
     
     if self.kind is None:
       assert self.processor is not None
+    self.use_lstm = use_lstm
 
   def _msg_passing_step(self,
                         mp_state: _MessagePassingScanState,
@@ -109,8 +108,8 @@ class Net(hk.Module):
                         nb_nodes: int,
                         inputs: _Trajectory,
                         first_step: bool = False):
-    if (not first_step) and repred: #and self.decode_hints:
-      decoded_hint = _decode_from_preds(self.spec, mp_state.hint_preds)
+    if (not first_step) and repred and self.decode_hints:
+      decoded_hint = decoders.postprocess(self.spec, mp_state.hint_preds)
       cur_hint = []
       for hint in decoded_hint:
         cur_hint.append(decoded_hint[hint])
@@ -137,11 +136,12 @@ class Net(hk.Module):
           hint_cur = jnp.expand_dims(hint_cur, -1)
           hint_nxt = jnp.expand_dims(hint_nxt, -1)
         gt_diffs[hint.location] += jnp.any(hint_cur != hint_nxt, axis=-1)
-      for loc in _Location:
+      for loc in [_Location.NODE, _Location.EDGE, _Location.GRAPH]:
         gt_diffs[loc] = (gt_diffs[loc] > 0.0).astype(jnp.float32) * 1.0
 
-    hiddens, output_preds_cand, hint_preds, diff_logits = self._one_step_pred(
-        inputs, cur_hint, mp_state.hiddens, nb_nodes, first_step)
+    (hiddens, output_preds_cand, hint_preds, diff_logits,
+     lstm_state) = self._one_step_pred(
+         inputs, cur_hint, mp_state.hiddens, nb_nodes, mp_state.lstm_state, first_step)
 
     if first_step:
       output_preds = output_preds_cand
@@ -157,7 +157,7 @@ class Net(hk.Module):
       if self.decode_hints:
         if hints[0].data.shape[0] == 1 or repred:
           diff_preds = {}
-          for loc in _Location:
+          for loc in [_Location.NODE, _Location.EDGE, _Location.GRAPH]:
             diff_preds[loc] = (diff_logits[loc] > 0.0).astype(jnp.float32) * 1.0
         else:
           diff_preds = gt_diffs
@@ -174,7 +174,7 @@ class Net(hk.Module):
               cur_diffs * hint_preds[hint.name] + (1.0 - cur_diffs) * prev_hint)
     new_mp_state = _MessagePassingScanState(
         hint_preds=hint_preds, diff_logits=diff_logits, gt_diffs=gt_diffs,
-        output_preds=output_preds, hiddens=hiddens)
+        output_preds=output_preds, hiddens=hiddens, lstm_state=lstm_state)
     # Complying to jax.scan, the first returned value is the state we carry over
     # the second value is the output that will be stacked over steps.
     return new_mp_state, new_mp_state
@@ -197,9 +197,20 @@ class Net(hk.Module):
     nb_mp_steps = max(1, hints[0].data.shape[0] - 1)
     hiddens = jnp.zeros((self.batch_size, nb_nodes, self.hidden_dim))
 
+    if self.use_lstm:
+      self.lstm = hk.LSTM(
+          hidden_size=self.hidden_dim,
+          name='processor_lstm')
+      lstm_state = self.lstm.initial_state(self.batch_size * nb_nodes)
+      lstm_state = jax.tree_multimap(
+          lambda x: jnp.reshape(x, [self.batch_size, nb_nodes, -1]), lstm_state)
+    else:
+      self.lstm = None
+      lstm_state = None
+
     mp_state = _MessagePassingScanState(
         hint_preds=None, diff_logits=None, gt_diffs=None,
-        output_preds=None, hiddens=hiddens)
+        output_preds=None, hiddens=hiddens, lstm_state=lstm_state)
 
     # Do the first step outside of the scan because it has a different
     # computation graph.
@@ -247,111 +258,25 @@ class Net(hk.Module):
 
   def _construct_encoders_decoders(self):
     """Constructs encoders and decoders."""
-    self.enc_inp = {}
-    self.dec_out = {}
-    if self.encode_hints:
-      self.enc_hint = {}
+    self.encoders = {}
+    self.decoders = {}
+
+    for name, (stage, loc, t) in self.spec.items():
+      if stage == _Stage.INPUT or (stage == _Stage.HINT and self.encode_hints):
+        # Build input encoders.
+        self.encoders[name] = encoders.construct_encoders(
+            loc, t, hidden_dim=self.hidden_dim)
+
+      if stage == _Stage.OUTPUT or (stage == _Stage.HINT and self.decode_hints):
+        # Build output decoders.
+        self.decoders[name] = decoders.construct_decoders(
+            loc, t, hidden_dim=self.hidden_dim, nb_dims=self.nb_dims[name])
+
     if self.decode_diffs:
+      # Optionally build diff decoders.
       self.node_dec_diff = hk.Linear(1)
       self.edge_dec_diff = (hk.Linear(1), hk.Linear(1), hk.Linear(1))
       self.graph_dec_diff = (hk.Linear(1), hk.Linear(1))
-    if self.decode_hints:
-      self.dec_hint = {}
-
-    for name in self.spec:
-      stage, loc, t = self.spec[name]
-      if stage == _Stage.INPUT:
-        self.enc_inp[name] = [hk.Linear(self.hidden_dim)]
-        if loc == _Location.EDGE and t == _Type.POINTER:
-          # Edge pointers need two-way encoders
-          self.enc_inp[name].append(hk.Linear(self.hidden_dim))
-
-      elif stage == _Stage.OUTPUT:
-        if loc == _Location.NODE:
-          if t in [_Type.SCALAR, _Type.MASK, _Type.MASK_ONE]:
-            self.dec_out[name] = (hk.Linear(1),)
-          elif t == _Type.CATEGORICAL:
-            self.dec_out[name] = (hk.Linear(self.nb_dims[name]),)
-          elif t == _Type.POINTER:
-            self.dec_out[name] = (hk.Linear(self.hidden_dim),
-                                  hk.Linear(self.hidden_dim))
-          else:
-            raise ValueError('Incorrect type')
-        elif loc == _Location.EDGE:
-          if t in [_Type.SCALAR, _Type.MASK, _Type.MASK_ONE]:
-            self.dec_out[name] = (hk.Linear(1), hk.Linear(1), hk.Linear(1))
-          elif t == _Type.CATEGORICAL:
-            cat_dims = self.nb_dims[name]
-            self.dec_out[name] = (hk.Linear(cat_dims), hk.Linear(cat_dims),
-                                  hk.Linear(cat_dims))
-          elif t == _Type.POINTER:
-            self.dec_out[name] = (hk.Linear(self.hidden_dim),
-                                  hk.Linear(self.hidden_dim),
-                                  hk.Linear(self.hidden_dim),
-                                  hk.Linear(self.hidden_dim))
-          else:
-            raise ValueError('Incorrect type')
-        elif loc == _Location.GRAPH:
-          if t in [_Type.SCALAR, _Type.MASK, _Type.MASK_ONE]:
-            self.dec_out[name] = (hk.Linear(1), hk.Linear(1))
-          elif t == _Type.CATEGORICAL:
-            cat_dims = self.nb_dims[name]
-            self.dec_out[name] = (hk.Linear(cat_dims), hk.Linear(cat_dims))
-          elif t == _Type.POINTER:
-            self.dec_out[name] = (hk.Linear(self.hidden_dim),
-                                  hk.Linear(self.hidden_dim),
-                                  hk.Linear(self.hidden_dim))
-          else:
-            raise ValueError('Incorrect type')
-        else:
-          raise ValueError('Incorrect location')
-
-      elif stage == _Stage.HINT:
-        if self.encode_hints:
-          self.enc_hint[name] = [hk.Linear(self.hidden_dim)]
-          if loc == _Location.EDGE and t == _Type.POINTER:
-            # Edge pointers need two-way encoders
-            self.enc_hint[name].append(hk.Linear(self.hidden_dim))
-
-        if self.decode_hints:
-          if loc == _Location.NODE:
-            if t in [_Type.SCALAR, _Type.MASK, _Type.MASK_ONE]:
-              self.dec_hint[name] = (hk.Linear(1),)
-            elif t == _Type.CATEGORICAL:
-              self.dec_hint[name] = (hk.Linear(self.nb_dims[name]),)
-            elif t == _Type.POINTER:
-              self.dec_hint[name] = (hk.Linear(self.hidden_dim),
-                                     hk.Linear(self.hidden_dim))
-            else:
-              raise ValueError('Incorrect type')
-          elif loc == _Location.EDGE:
-            if t in [_Type.SCALAR, _Type.MASK, _Type.MASK_ONE]:
-              self.dec_hint[name] = (hk.Linear(1), hk.Linear(1), hk.Linear(1))
-            elif t == _Type.CATEGORICAL:
-              cat_dims = self.nb_dims[name]
-              self.dec_hint[name] = (hk.Linear(cat_dims), hk.Linear(cat_dims),
-                                     hk.Linear(cat_dims))
-            elif t == _Type.POINTER:
-              self.dec_hint[name] = (hk.Linear(self.hidden_dim),
-                                     hk.Linear(self.hidden_dim),
-                                     hk.Linear(self.hidden_dim),
-                                     hk.Linear(self.hidden_dim))
-            else:
-              raise ValueError('Incorrect type')
-          elif loc == _Location.GRAPH:
-            if t in [_Type.SCALAR, _Type.MASK, _Type.MASK_ONE]:
-              self.dec_hint[name] = (hk.Linear(1), hk.Linear(1))
-            elif t == _Type.CATEGORICAL:
-              cat_dims = self.nb_dims[name]
-              self.dec_hint[name] = (hk.Linear(cat_dims), hk.Linear(cat_dims))
-            elif t == _Type.POINTER:
-              self.dec_hint[name] = (hk.Linear(self.hidden_dim),
-                                     hk.Linear(self.hidden_dim),
-                                     hk.Linear(self.hidden_dim))
-            else:
-              raise ValueError('Incorrect type')
-          else:
-            raise ValueError('Incorrect location')
 
   def _construct_processor(self):
     """Constructs processor."""
@@ -368,12 +293,27 @@ class Net(hk.Module):
               self.hidden_dim,
               self.hidden_dim,
           ])
-    elif self.kind == 'gat':
+    elif self.kind in ['gat', 'gat_full']:
       self.mpnn = processors.GAT(
           out_size=self.hidden_dim,
           nb_heads=1,
           activation=jax.nn.relu,
           residual=True)
+    elif self.kind in ['gatv2', 'gatv2_full']:
+      self.mpnn = processors.GAT(
+          out_size=self.hidden_dim,
+          nb_heads=1,
+          activation=jax.nn.relu,
+          residual=True)
+    elif self.kind == 'memnet_full' or self.kind == 'memnet_masked':
+      self.memnet = processors.MemNet(
+          vocab_size=self.hidden_dim,
+          embedding_size=16,
+          sentence_size=self.hidden_dim,
+          linear_output_size=self.hidden_dim,
+          memory_size=128,
+          num_hops=1,
+          apply_embeddings=True)
 
   def _one_step_pred(
       self,
@@ -381,103 +321,79 @@ class Net(hk.Module):
       hints: _Trajectory,
       hidden: _Array,
       nb_nodes: int,
+      lstm_state: Optional[hk.LSTMState],
       first_step: bool,
   ):
-    """Generates one step predictions."""
+    """Generates one-step predictions."""
 
+    # Initialise empty node/edge/graph features and adjacency matrix.
     node_fts = jnp.zeros((self.batch_size, nb_nodes, self.hidden_dim))
     edge_fts = jnp.zeros((self.batch_size, nb_nodes, nb_nodes, self.hidden_dim))
     graph_fts = jnp.zeros((self.batch_size, self.hidden_dim))
     adj_mat = jnp.repeat(
         jnp.expand_dims(jnp.eye(nb_nodes), 0), self.batch_size, axis=0)
 
-    for inp in inputs:
-      # Extract shared logic with hints and loss
-      encoder = self.enc_inp[inp.name][0]
-      if inp.type_ == _Type.POINTER:
-        in_data = hk.one_hot(inp.data, nb_nodes)
-      else:
-        in_data = inp.data.astype(jnp.float32)
-      if inp.type_ == _Type.CATEGORICAL:
-        encoding = encoder(in_data)
-      else:
-        encoding = encoder(jnp.expand_dims(in_data, -1))
-      if inp.location == _Location.NODE:
-        if inp.type_ == _Type.POINTER:
-          edge_fts += encoding
-          adj_mat += ((in_data + jnp.transpose(in_data, (0, 2, 1))) >
-                      0.0).astype('float32')
-        else:
-          node_fts += encoding
-      elif inp.location == _Location.EDGE:
-        if inp.type_ == _Type.POINTER:
-          # Aggregate pointer contributions across sender and receiver nodes
-          encoding_2 = self.enc_inp[inp.name][1](jnp.expand_dims(in_data, -1))
-          edge_fts += jnp.mean(encoding, axis=1) + jnp.mean(encoding_2, axis=2)
-        else:
-          edge_fts += encoding
-          if inp.type_ == _Type.MASK:
-            adj_mat += (in_data > 0.0).astype('float32')
-      elif inp.location == _Location.GRAPH:
-        if inp.type_ == _Type.POINTER:
-          node_fts += encoding
-        else:
-          graph_fts += encoding
+    # ENCODE ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+    # Encode node/edge/graph features from inputs and (optionally) hints.
+    trajectories = [inputs]
     if self.encode_hints:
-      for hint in hints:
-        encoder = self.enc_hint[hint.name][0]
-        if hint.type_ == _Type.POINTER:
-          in_data = hk.one_hot(hint.data, nb_nodes)
-        else:
-          in_data = hint.data.astype(jnp.float32)
-        if hint.type_ == _Type.CATEGORICAL:
-          encoding = encoder(in_data)
-        else:
-          encoding = encoder(jnp.expand_dims(in_data, -1))
-        if hint.location == _Location.NODE:
-          if hint.type_ == _Type.POINTER:
-            edge_fts += encoding
-            adj_mat += ((in_data + jnp.transpose(in_data, (0, 2, 1))) >
-                        0.0).astype('float32')
-          else:
-            node_fts += encoding
-        elif hint.location == _Location.EDGE:
-          if hint.type_ == _Type.POINTER:
-            # Aggregate pointer contributions across sender and receiver nodes
-            encoding_2 = self.enc_hint[hint.name][1](
-                jnp.expand_dims(in_data, -1))
-            edge_fts += jnp.mean(encoding, axis=1) + jnp.mean(
-                encoding_2, axis=2)
-          else:
-            edge_fts += encoding
-            if hint.type_ == _Type.MASK:
-              adj_mat += (in_data > 0.0).astype('float32')
-        elif hint.location == _Location.GRAPH:
-          if hint.type_ == _Type.POINTER:
-            node_fts += encoding
-          else:
-            graph_fts += encoding
-        else:
-          raise ValueError('Invalid hint location')
+      trajectories.append(hints)
+
+    for trajectory in trajectories:
+      for dp in trajectory:
+        try:
+          data = encoders.preprocess(dp, nb_nodes)
+          adj_mat = encoders.accum_adj_mat(dp, data, adj_mat)
+          encoder = self.encoders[dp.name]
+          edge_fts = encoders.accum_edge_fts(encoder, dp, data, edge_fts)
+          node_fts = encoders.accum_node_fts(encoder, dp, data, node_fts)
+          graph_fts = encoders.accum_graph_fts(encoder, dp, data, graph_fts)
+        except Exception as e:
+          raise Exception(f'Failed to process {dp}') from e
+
+    # PROCESS ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
     if self.kind is None:
       adj_mat = self.mpnn.preprocess_adjmat(adj_mat)
     elif self.kind == 'deepsets':
       adj_mat = jnp.repeat(
-          jnp.expand_dims(jnp.eye(adj_mat.shape[1]), 0), adj_mat.shape[0], axis=0)
-    elif self.kind == 'mpnn' or self.kind == 'gat':
+          jnp.expand_dims(jnp.eye(nb_nodes), 0), self.batch_size, axis=0)
+    elif (self.kind == 'mpnn' or self.kind == 'gat_full' or
+          self.kind == 'gatv2_full' or self.kind == 'memnet_full'):
       adj_mat = jnp.ones_like(adj_mat)
-    elif self.kind == 'pgn':
+    elif (self.kind == 'pgn' or self.kind == 'gat' or self.kind == 'gatv2' or
+          self.kind == 'memnet_masked'):
       adj_mat = (adj_mat > 0.0) * 1.0
     else:
       raise ValueError('Unsupported kind of model')
 
     z = jnp.concatenate([node_fts, hidden], axis=-1)
-    nxt_hidden = self.mpnn(hidden, node_fts, edge_fts, graph_fts,
-                           (adj_mat > 0.0).astype('float32'), first_step)
+    if self.kind == 'memnet_full' or self.kind == 'memnet_masked':
+      node_and_graph_fts = jnp.concatenate(
+          [node_fts, graph_fts[:, None]], axis=1)
+      edge_fts_padded = jnp.pad(edge_fts * adj_mat[..., None],
+                                ((0, 0), (0, 1), (0, 1), (0, 0)))
+      nxt_hidden = jax.vmap(self.memnet, (1), 1)(node_and_graph_fts,
+                                                 edge_fts_padded)
+      # Broadcast hidden state corresponding to graph features across the nodes.
+      nxt_hidden = nxt_hidden[:, :-1] + nxt_hidden[:, -1:]
+    else:
+      nxt_hidden = self.mpnn(hidden, node_fts, edge_fts, graph_fts,
+                             (adj_mat > 0.0).astype('float32'), first_step)
+
+    nxt_hidden = hk.dropout(hk.next_rng_key(), self._dropout_prob, nxt_hidden)
+
+    if self.use_lstm:
+      # lstm doesn't accept multiple batch dimensions (in our case, batch and
+      # nodes), so we vmap over the (first) batch dimension.
+      nxt_hidden, nxt_lstm_state = jax.vmap(self.lstm)(nxt_hidden, lstm_state)
+    else:
+      nxt_lstm_state = None
+
     h_t = jnp.concatenate([z, nxt_hidden], axis=-1)
 
+    # DECODE ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     hint_preds = {}
     output_preds = {}
     diff_preds = {}
@@ -501,127 +417,31 @@ class Net(hk.Module):
           _Location.GRAPH: jnp.ones((self.batch_size))
       }
 
-    if self.decode_hints:
-      for hint in hints:
-        decoders = self.dec_hint[hint.name]
+    # Decode features and (optionally) hints.
+    for name in self.decoders:
+      decoder = self.decoders[name]
+      stage, loc, t = self.spec[name]
 
-        if hint.location == _Location.NODE:
-          if hint.type_ in [
-              _Type.SCALAR, _Type.MASK, _Type.MASK_ONE
-          ]:
-            hint_preds[hint.name] = jnp.squeeze(decoders[0](h_t), -1)
-          elif hint.type_ == _Type.CATEGORICAL:
-            hint_preds[hint.name] = decoders[0](h_t)
-          elif hint.type_ == _Type.POINTER:
-            p_1 = decoders[0](h_t)
-            p_2 = decoders[1](h_t)
-            ptr_p = jnp.matmul(p_1, jnp.transpose(p_2, (0, 2, 1)))
-            hint_preds[hint.name] = ptr_p
-            if self.inf_bias:
-              hint_preds[hint.name] -= (1 - adj_mat) * _BIG_NUMBER
-          else:
-            raise ValueError('Invalid hint type')
-        elif hint.location == _Location.EDGE:
-          pred_1 = decoders[0](h_t)
-          pred_2 = decoders[1](h_t)
-          pred_e = decoders[2](edge_fts)
-          pred = (
-              jnp.expand_dims(pred_1, -2) + jnp.expand_dims(pred_2, -3) +
-              pred_e)
-          if hint.type_ in [
-              _Type.SCALAR, _Type.MASK, _Type.MASK_ONE
-          ]:
-            hint_preds[hint.name] = jnp.squeeze(pred, -1)
-          elif hint.type_ == _Type.CATEGORICAL:
-            hint_preds[hint.name] = pred
-          elif hint.type_ == _Type.POINTER:
-            pred_2 = jnp.expand_dims(decoders[3](h_t), -1)
-            ptr_p = jnp.matmul(pred, jnp.transpose(pred_2, (0, 3, 2, 1)))
-            hint_preds[hint.name] = ptr_p
-          else:
-            raise ValueError('Invalid hint type')
-          if self.inf_bias_edge and hint.type_ in [
-              _Type.MASK, _Type.MASK_ONE
-          ]:
-            hint_preds[hint.name] -= (1 - adj_mat) * _BIG_NUMBER
-        elif hint.location == _Location.GRAPH:
-          gr_emb = jnp.max(h_t, axis=-2)
-          pred_n = decoders[0](gr_emb)
-          pred_g = decoders[1](graph_fts)
-          pred = pred_n + pred_g
-          if hint.type_ in [
-              _Type.SCALAR, _Type.MASK, _Type.MASK_ONE
-          ]:
-            hint_preds[hint.name] = jnp.squeeze(pred, -1)
-          elif hint.type_ == _Type.CATEGORICAL:
-            hint_preds[hint.name] = pred
-          elif hint.type_ == _Type.POINTER:
-            pred_2 = decoders[2](h_t)
-            ptr_p = jnp.matmul(
-                jnp.expand_dims(pred, 1), jnp.transpose(pred_2, (0, 2, 1)))
-            hint_preds[hint.name] = jnp.squeeze(ptr_p, 1)
-          else:
-            raise ValueError('Invalid hint type')
+      if loc == _Location.NODE:
+        preds = decoders.decode_node_fts(decoder, t, h_t, adj_mat,
+                                         self.inf_bias)
+      elif loc == _Location.EDGE:
+        preds = decoders.decode_edge_fts(decoder, t, h_t, edge_fts, adj_mat,
+                                         self.inf_bias_edge)
+      elif loc == _Location.GRAPH:
+        preds = decoders.decode_graph_fts(decoder, t, h_t, graph_fts)
+      else:
+        raise ValueError('Invalid output type')
 
-    for out_name in self.dec_out:
-      decoders = self.dec_out[out_name]
-      _, out_location, out_type = self.spec[out_name]
-      if out_location == _Location.NODE:
-        if out_type in [
-            _Type.SCALAR, _Type.MASK, _Type.MASK_ONE
-        ]:
-          output_preds[out_name] = jnp.squeeze(decoders[0](h_t), -1)
-        elif out_type == _Type.CATEGORICAL:
-          output_preds[out_name] = decoders[0](h_t)
-        elif out_type == _Type.POINTER:
-          p_1 = decoders[0](h_t)
-          p_2 = decoders[1](h_t)
-          ptr_p = jnp.matmul(p_1, jnp.transpose(p_2, (0, 2, 1)))
-          output_preds[out_name] = ptr_p
-          if self.inf_bias:
-            output_preds[out_name] -= (1 - adj_mat) * _BIG_NUMBER
-        else:
-          raise ValueError('Invalid output type')
-      elif out_location == _Location.EDGE:
-        pred_1 = decoders[0](h_t)
-        pred_2 = decoders[1](h_t)
-        pred_e = decoders[2](edge_fts)
-        pred = (
-            jnp.expand_dims(pred_1, -2) + jnp.expand_dims(pred_2, -3) + pred_e)
-        if out_type in [
-            _Type.SCALAR, _Type.MASK, _Type.MASK_ONE
-        ]:
-          output_preds[out_name] = jnp.squeeze(pred, -1)
-        elif out_type == _Type.CATEGORICAL:
-          output_preds[out_name] = pred
-        elif out_type == _Type.POINTER:
-          pred_2 = jnp.expand_dims(decoders[3](h_t), -1)
-          ptr_p = jnp.matmul(pred, jnp.transpose(pred_2, (0, 3, 2, 1)))
-          output_preds[out_name] = ptr_p
-        else:
-          raise ValueError('Invalid output type')
-        if self.inf_bias_edge and out_type in [_Type.MASK, _Type.MASK_ONE]:
-          output_preds[out_name] -= (1 - adj_mat) * _BIG_NUMBER
-      elif out_location == _Location.GRAPH:
-        gr_emb = jnp.max(h_t, axis=-2)
-        pred_n = decoders[0](gr_emb)
-        pred_g = decoders[1](graph_fts)
-        pred = pred_n + pred_g
-        if out_type in [
-            _Type.SCALAR, _Type.MASK, _Type.MASK_ONE
-        ]:
-          output_preds[out_name] = jnp.squeeze(pred, -1)
-        elif out_type == _Type.CATEGORICAL:
-          output_preds[out_name] = pred
-        elif out_type == _Type.POINTER:
-          pred_2 = decoders[2](h_t)
-          ptr_p = jnp.matmul(
-              jnp.expand_dims(pred, 1), jnp.transpose(pred_2, (0, 2, 1)))
-          output_preds[out_name] = jnp.squeeze(ptr_p, 1)
-        else:
-          raise ValueError('Invalid output type')
+      if stage == _Stage.OUTPUT:
+        output_preds[name] = preds
+      elif stage == _Stage.HINT:
+        assert self.decode_hints
+        hint_preds[name] = preds
+      else:
+        raise ValueError(f'Found unexpected decoder {name}')
 
-    return nxt_hidden, output_preds, hint_preds, diff_preds
+    return nxt_hidden, output_preds, hint_preds, diff_preds, nxt_lstm_state
 
 
 class BaselineModel(model.Model):
@@ -654,10 +474,12 @@ class BaselineModel(model.Model):
       encode_hints=False,
       decode_hints=True,
       decode_diffs=False,
+      use_lstm=False,
       learning_rate=0.005,
       checkpoint_path='/tmp/clrs3',
       freeze_processor=False,
       dummy_trajectory=None,
+      dropout_prob=0.0,
       name='base_model',
   ):
     super(BaselineModel, self).__init__(spec=spec)
@@ -693,11 +515,12 @@ class BaselineModel(model.Model):
       self.nb_dims[outp.name] = outp.data.shape[-1]
 
     def _use_net(*args, **kwargs):
-      return Net(spec, hidden_dim, encode_hints, decode_hints, decode_diffs, 
-                 inf_bias, inf_bias_edge, self.nb_dims, kind=kind, processor=processor)(*args, **kwargs)
+      return Net(spec, hidden_dim, encode_hints, decode_hints, decode_diffs,
+                 kind, inf_bias, inf_bias_edge, use_lstm, dropout_prob,
+                 self.nb_dims, processor)(*args, **kwargs)
 
-    self.net_fn = hk.without_apply_rng(hk.transform(_use_net))
-    self.net_fn_apply = jax.jit(self.net_fn.apply, static_argnums=2)
+    self.net_fn = hk.transform(_use_net)
+    self.net_fn_apply = jax.jit(self.net_fn.apply, static_argnums=3)
     self.params = None
     self.opt_state = None
 
@@ -705,150 +528,69 @@ class BaselineModel(model.Model):
     self.params = self.net_fn.init(jax.random.PRNGKey(seed), features, True)
     self.opt_state = self.opt.init(self.params)
 
-  def feedback(self, feedback: _Feedback) -> float:
+  def feedback(self, rng_key: hk.PRNGSequence, feedback: _Feedback) -> float:
     """Advance to the next task, incorporating any available feedback."""
-    self.params, self.opt_state, cur_loss = self.update(self.params,
-                                                        self.opt_state,
-                                                        feedback)
+    self.params, self.opt_state, cur_loss = self.update(
+        rng_key, self.params, self.opt_state, feedback)
     return cur_loss
 
-  def predict(self, features: _Features):
+  def predict(self, rng_key: hk.PRNGSequence, features: _Features):
     """Model inference step."""
     outs, hint_preds, diff_logits, gt_diff = self.net_fn_apply(
-        self.params, features, True)
-    return _decode_from_preds(self.spec,
-                              outs), (hint_preds, diff_logits, gt_diff)
+        self.params, rng_key, features, True)
+    return decoders.postprocess(self.spec,
+                                outs), (hint_preds, diff_logits, gt_diff)
 
   def update(
       self,
+      rng_key: hk.PRNGSequence,
       params: hk.Params,
       opt_state: optax.OptState,
       feedback: _Feedback,
   ) -> Tuple[hk.Params, optax.OptState, _Array]:
     """Model update step."""
 
-    def loss(params, feedback):
+    def loss(params, rng_key, feedback):
+      """Calculates model loss f(feedback; params)."""
       (output_preds, hint_preds, diff_logits,
-       gt_diffs) = self.net_fn_apply(params, feedback.features, False)
+       gt_diffs) = self.net_fn_apply(params, rng_key, feedback.features, False)
 
-      for inp in feedback.features.inputs:
-        if inp.location in [_Location.NODE, _Location.EDGE]:
-          nb_nodes = inp.data.shape[1]
-          break
-
-      total_loss = 0.0
+      nb_nodes = _nb_nodes(feedback)
       lengths = feedback.features.lengths
+      total_loss = 0.0
+
+      # Calculate output loss.
+      for truth in feedback.outputs:
+        total_loss += losses.output_loss(
+            truth=truth,
+            preds=output_preds,
+            nb_nodes=nb_nodes,
+        )
+
+      # Optionally accumulate diff losses.
       if self.decode_diffs:
-        for loc in _Location:
-          for i in range(len(gt_diffs)):
-            is_not_done = _is_not_done_broadcast(
-                lengths, i, diff_logits[i][loc])
-            diff_loss = (
-                jnp.maximum(diff_logits[i][loc], 0) -
-                diff_logits[i][loc] * gt_diffs[i][loc] +
-                jnp.log1p(jnp.exp(-jnp.abs(diff_logits[i][loc]))) *
-                is_not_done)
+        total_loss += losses.diff_loss(
+            diff_logits=diff_logits,
+            gt_diffs=gt_diffs,
+            lengths=lengths,
+        )
 
-            total_loss += jnp.mean(diff_loss)
-
+      # Optionally accumulate hint losses.
       if self.decode_hints:
         for truth in feedback.features.hints:
-          for i in range(truth.data.shape[0] - 1):
-            assert truth.name in hint_preds[i]
-            pred = hint_preds[i][truth.name]
-            is_not_done = _is_not_done_broadcast(
-                lengths, i, truth.data[i + 1])
-            if truth.type_ == _Type.SCALAR:
-              if self.decode_diffs:
-                total_loss += jnp.mean(
-                    (pred - truth.data[i + 1])**2 *
-                    gt_diffs[i][truth.location] * is_not_done)
-              else:
-                total_loss += jnp.mean(
-                    (pred - truth.data[i + 1])**2 * is_not_done)
-            elif truth.type_ == _Type.MASK:
-              if self.decode_diffs:
-                loss = jnp.mean(
-                    jnp.maximum(pred, 0) - pred * truth.data[i + 1] +
-                    jnp.log1p(jnp.exp(-jnp.abs(pred))) *
-                    gt_diffs[i][truth.location] * is_not_done)
-              else:
-                loss = jnp.mean(
-                    jnp.maximum(pred, 0) - pred * truth.data[i + 1] +
-                    jnp.log1p(jnp.exp(-jnp.abs(pred))) * is_not_done)
-              mask = (truth.data != _OutputClass.MASKED.value).astype(
-                  jnp.float32)
-              total_loss += jnp.sum(loss*mask)/jnp.sum(mask)
-            elif truth.type_ == _Type.MASK_ONE:
-              if self.decode_diffs:
-                total_loss += jnp.mean(
-                    -jnp.sum(
-                        truth.data[i + 1] * jax.nn.log_softmax(
-                            pred) * is_not_done, axis=-1, keepdims=True) *
-                    gt_diffs[i][truth.location])
-              else:
-                total_loss += jnp.mean(-jnp.sum(
-                    truth.data[i + 1] * jax.nn.log_softmax(
-                        pred) * is_not_done, axis=-1))
-            elif truth.type_ == _Type.CATEGORICAL:
-              unmasked_data = truth.data[
-                  truth.data == _OutputClass.POSITIVE.value]
-              masked_truth = truth.data * (
-                  truth.data != _OutputClass.MASKED.value).astype(jnp.float32)
-              if self.decode_diffs:
-                total_loss += jnp.sum(
-                    -jnp.sum(
-                        masked_truth[i + 1] * jax.nn.log_softmax(
-                            pred), axis=-1, keepdims=True) *
-                    jnp.expand_dims(gt_diffs[i][truth.location], -1) *
-                    is_not_done) / jnp.sum(unmasked_data)
-              else:
-                total_loss += jnp.sum(-jnp.sum(
-                    masked_truth[i + 1] * jax.nn.log_softmax(pred), axis=-1) *
-                                      is_not_done) / jnp.sum(unmasked_data)
-            elif truth.type_ == _Type.POINTER:
-              if self.decode_diffs:
-                total_loss += jnp.mean(-jnp.sum(
-                    hk.one_hot(truth.data[i + 1], nb_nodes) *
-                    jax.nn.log_softmax(pred),
-                    axis=-1) * gt_diffs[i][truth.location] * is_not_done)
-              else:
-                total_loss += jnp.mean(-jnp.sum(
-                    hk.one_hot(truth.data[i + 1], nb_nodes) *
-                    jax.nn.log_softmax(pred),
-                    axis=-1) * is_not_done)
-            else:
-              raise ValueError('Incorrect type')
-        total_loss /= (truth.data.shape[0] - 1)  # pylint: disable=undefined-loop-variable
-
-      for truth in feedback.outputs:
-        assert truth.name in output_preds
-        pred = output_preds[truth.name]
-        if truth.type_ == _Type.SCALAR:
-          total_loss += jnp.mean((pred - truth.data)**2)
-        elif truth.type_ == _Type.MASK:
-          loss = (jnp.maximum(pred, 0) - pred * truth.data +
-                  jnp.log1p(jnp.exp(-jnp.abs(pred))))
-          mask = (truth.data != _OutputClass.MASKED.value).astype(jnp.float32)
-          total_loss += jnp.sum(loss*mask)/jnp.sum(mask)
-        elif truth.type_ in [_Type.MASK_ONE, _Type.CATEGORICAL]:
-          unmasked_data = truth.data[truth.data == _OutputClass.POSITIVE.value]
-          masked_truth = truth.data * (
-              truth.data != _OutputClass.MASKED.value).astype(jnp.float32)
-          total_loss += (
-              -jnp.sum(masked_truth * jax.nn.log_softmax(pred))
-              / jnp.sum(unmasked_data))
-        elif truth.type_ == _Type.POINTER:
-          total_loss += (
-              jnp.mean(-jnp.sum(
-                  hk.one_hot(truth.data, nb_nodes) * jax.nn.log_softmax(pred),
-                  axis=-1)))
-        else:
-          raise ValueError('Incorrect type')
+          total_loss += losses.hint_loss(
+              truth=truth,
+              preds=hint_preds,
+              gt_diffs=gt_diffs,
+              lengths=lengths,
+              nb_nodes=nb_nodes,
+              decode_diffs=self.decode_diffs,
+          )
 
       return total_loss
 
-    lss, grads = jax.value_and_grad(loss)(params, feedback)
+    # Calculate and apply gradients.
+    lss, grads = jax.value_and_grad(loss)(params, rng_key, feedback)
     updates, opt_state = self.opt.update(grads, opt_state)
     if self._freeze_processor:
       params_subset = _filter_processor(params)
@@ -857,91 +599,42 @@ class BaselineModel(model.Model):
       new_params = hk.data_structures.merge(params, new_params)
     else:
       new_params = optax.apply_updates(params, updates)
+
     return new_params, opt_state, lss
 
   def verbose_loss(self, feedback: _Feedback, extra_info) -> Dict[str, _Array]:
     """Gets verbose loss information."""
     hint_preds, diff_logits, gt_diffs = extra_info
 
-    for inp in feedback.features.inputs:
-      if inp.location in [_Location.NODE, _Location.EDGE]:
-        nb_nodes = inp.data.shape[1]
-        break
-
-    total_loss = 0.0
+    nb_nodes = _nb_nodes(feedback)
     lengths = feedback.features.lengths
+    losses_ = {}
 
-    losses = {}
+    # Optionally accumulate diff losses.
     if self.decode_diffs:
-      for loc in _Location:
-        for i in range(len(gt_diffs)):
-          is_not_done = _is_not_done_broadcast(lengths, i, gt_diffs[i][loc])
-          diff_loss = (
-              jnp.maximum(diff_logits[i][loc], 0) -
-              diff_logits[i][loc] * gt_diffs[i][loc] +
-              jnp.log1p(jnp.exp(-jnp.abs(diff_logits[i][loc]))) * is_not_done)
-          losses[loc.name + '_diff_%d' % i] = jnp.mean(diff_loss)
+      losses_.update(
+          losses.diff_loss(
+              diff_logits=diff_logits,
+              gt_diffs=gt_diffs,
+              lengths=lengths,
+              verbose=True,
+          ))
 
+    # Optionally accumulate hint losses.
     if self.decode_hints:
       for truth in feedback.features.hints:
-        for i in range(truth.data.shape[0] - 1):
-          assert truth.name in hint_preds[i]
-          pred = hint_preds[i][truth.name]
-          is_not_done = _is_not_done_broadcast(lengths, i, truth.data[i + 1])
-          if truth.type_ == _Type.SCALAR:
-            if self.decode_diffs:
-              total_loss = jnp.mean((pred - truth.data[i + 1])**2 *
-                                    gt_diffs[i][truth.location] * is_not_done)
-            else:
-              total_loss = jnp.mean((pred - truth.data[i + 1])**2 * is_not_done)
-          elif truth.type_ == _Type.MASK:
-            if self.decode_diffs:
-              total_loss = jnp.mean(
-                  jnp.maximum(pred, 0) - pred * truth.data[i + 1] +
-                  jnp.log1p(jnp.exp(-jnp.abs(pred))) *
-                  gt_diffs[i][truth.location] * is_not_done)
-            else:
-              total_loss = jnp.mean(
-                  jnp.maximum(pred, 0) - pred * truth.data[i + 1] +
-                  jnp.log1p(jnp.exp(-jnp.abs(pred))) * is_not_done)
-          elif truth.type_ == _Type.MASK_ONE:
-            if self.decode_diffs:
-              total_loss = jnp.mean(
-                  -jnp.sum(
-                      truth.data[i + 1] * jax.nn.log_softmax(
-                          pred) * is_not_done, axis=-1, keepdims=True) *
-                  gt_diffs[i][truth.location])
-            else:
-              total_loss = jnp.mean(-jnp.sum(
-                  truth.data[i + 1] * jax.nn.log_softmax(
-                      pred) * is_not_done, axis=-1))
-          elif truth.type_ == _Type.CATEGORICAL:
-            if self.decode_diffs:
-              total_loss = jnp.mean(
-                  -jnp.sum(
-                      truth.data[i + 1] * jax.nn.log_softmax(
-                          pred), axis=-1, keepdims=True) *
-                  jnp.expand_dims(gt_diffs[i][truth.location], -1) *
-                  is_not_done)
-            else:
-              total_loss = jnp.mean(-jnp.sum(
-                  truth.data[i + 1] * jax.nn.log_softmax(pred), axis=-1) *
-                                    is_not_done)
-          elif truth.type_ == _Type.POINTER:
-            if self.decode_diffs:
-              total_loss = jnp.mean(-jnp.sum(
-                  hk.one_hot(truth.data[i + 1], nb_nodes) *
-                  jax.nn.log_softmax(pred),
-                  axis=-1) * gt_diffs[i][truth.location] * is_not_done)
-            else:
-              total_loss = jnp.mean(-jnp.sum(
-                  hk.one_hot(truth.data[i + 1], nb_nodes) *
-                  jax.nn.log_softmax(pred),
-                  axis=-1) * is_not_done)
-          else:
-            raise ValueError('Incorrect type')
-          losses[truth.name + '_%d' % i] = total_loss
-    return losses
+        losses_.update(
+            losses.hint_loss(
+                truth=truth,
+                preds=hint_preds,
+                gt_diffs=gt_diffs,
+                lengths=lengths,
+                nb_nodes=nb_nodes,
+                decode_diffs=self.decode_diffs,
+                verbose=True,
+            ))
+
+    return losses_
 
   def restore_model(self, file_name: str, only_load_processor: bool = False):
     """Restore model from `file_name`."""
@@ -964,29 +657,20 @@ class BaselineModel(model.Model):
       pickle.dump(to_save, f)
 
 
-def _decode_from_preds(spec: _Spec, preds: _Array) -> Dict[str, _DataPoint]:
-  """Decodes outputs using appropriate functions depending on algorithm spec."""
-  result = {}
-  for name in preds.keys():
-    _, loc, typ = spec[name]
-    data = preds[name]
-    if typ == _Type.SCALAR:
-      pass
-    elif typ == _Type.MASK:
-      data = (data > 0.0) * 1.0
-    elif typ in [_Type.MASK_ONE, _Type.CATEGORICAL]:
-      cat_size = data.shape[-1]
-      best = jnp.argmax(data, -1)
-      data = hk.one_hot(best, cat_size)
-    elif typ == _Type.POINTER:
-      data = jnp.argmax(data, -1)
-    else:
-      raise ValueError('Invalid type')
-    result[name] = probing.DataPoint(
-        name=name, location=loc, type_=typ, data=data)
-  return result
+def _nb_nodes(feedback: _Feedback):
+  for inp in feedback.features.inputs:
+    if inp.location in [_Location.NODE, _Location.EDGE]:
+      return inp.data.shape[1]
+  assert False
 
 
 def _filter_processor(params: hk.Params) -> hk.Params:
   return hk.data_structures.filter(
       lambda module_name, n, v: 'construct_processor' in module_name, params)
+
+
+def _is_not_done_broadcast(lengths, i, tensor):
+  is_not_done = (lengths > i + 1) * 1.0
+  while len(is_not_done.shape) < len(tensor.shape):
+    is_not_done = jnp.expand_dims(is_not_done, -1)
+  return is_not_done

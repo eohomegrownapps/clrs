@@ -30,31 +30,23 @@ At minimum, each node contains a `pos` probe that serves as a unique index e.g.
 for representing sequential data where appropriate
 """
 
-import enum
 import types
 from typing import Dict, Tuple
 
 
-class _OrderedEnum(enum.Enum):
-
-  def __lt__(self, other):
-    assert self.__class__ is other.__class__
-    return self.value < other.value  # pylint: disable=comparison-with-callable
-
-
-class Stage(_OrderedEnum):
+class Stage:
   INPUT = 'input'
   OUTPUT = 'output'
   HINT = 'hint'
 
 
-class Location(_OrderedEnum):
+class Location:
   NODE = 'node'
   EDGE = 'edge'
   GRAPH = 'graph'
 
 
-class Type(_OrderedEnum):
+class Type:
   SCALAR = 'scalar'
   CATEGORICAL = 'categorical'
   MASK = 'mask'
@@ -62,36 +54,58 @@ class Type(_OrderedEnum):
   POINTER = 'pointer'
 
 
-class OutputClass(_OrderedEnum):
+class OutputClass:
   POSITIVE = 1
   NEGATIVE = 0
   MASKED = -1
 
-Spec = Dict[str, Tuple[Stage, Location, Type]]
+Spec = Dict[str, Tuple[str, str, str]]
 
-CLRS_21_ALGS = [
+CLRS_30_ALGS = [
+    'articulation_points',
+    'activity_selector',
     'bellman_ford',
     'bfs',
     'binary_search',
+    'bridges',
     'bubble_sort',
     'dag_shortest_paths',
     'dfs',
     'dijkstra',
     'find_maximum_subarray_kadane',
     'floyd_warshall',
+    'graham_scan',
     'heapsort',
     'insertion_sort',
+    'jarvis_march',
     'kmp_matcher',
+    'lcs_length',
     'matrix_chain_order',
     'minimum',
+    'mst_kruskal',
     'mst_prim',
     'naive_string_matcher',
     'optimal_bst',
     'quickselect',
     'quicksort',
+    'segments_intersect',
+    'strongly_connected_components',
     'task_scheduling',
     'topological_sort',
 ]
+
+
+# Algorithms have varying numbers of signals they are evaluated on.
+# To compensate for that, we issue more samples for those who use a small
+# number of signals.
+CLRS_30_ALGS_SETTINGS = {alg: {'num_samples_multiplier': 1}
+                         for alg in CLRS_30_ALGS}
+CLRS_30_ALGS_SETTINGS['find_maximum_subarray_kadane'][
+    'num_samples_multiplier'] = 32
+for alg in ['quickselect', 'minimum', 'binary_search', 'naive_string_matcher',
+            'kmp_matcher', 'segments_intersect']:
+  CLRS_30_ALGS_SETTINGS[alg]['num_samples_multiplier'] = 64
+
 
 SPECS = types.MappingProxyType({
     'insertion_sort': {
