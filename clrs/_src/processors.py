@@ -28,7 +28,15 @@ import jax.numpy as jnp
 _Array = chex.Array
 _Fn = Callable[..., Any]
 
+DEFAULT_HIDDEN_INPUT = {
+  "first_step": ['n_features', 'hidden'],
+  "nth_step": ['n_features', 'hidden'],
+}
+
 class Processor(hk.Module, abc.ABC):
+  def __init__(self, name: Optional[str] = None):
+    super().__init__(name)
+  
   @abc.abstractmethod
   def __call__(
       self,
@@ -88,13 +96,58 @@ class GAT(Processor):
       activation: Optional[_Fn] = None,
       residual: bool = True,
       name: str = 'gat_aggr',
+      hidden_input: Dict[str, List[str]] = DEFAULT_HIDDEN_INPUT,
   ):
     super().__init__(name=name)
     self.out_size = out_size
     self.nb_heads = nb_heads
     self.activation = activation
     self.residual = residual
+    self.hidden_input = hidden_input
 
+  def step(
+    self,
+    hidden: _Array,
+    e_features: _Array,
+    g_features: _Array,
+    adj: _Array
+  ) -> _Array:
+    b, n, _ = hidden.shape
+    assert e_features.shape[:-1] == (b, n, n)
+    assert g_features.shape[:-1] == (b,)
+    assert adj.shape == (b, n, n)
+
+    m = hk.Linear(self.out_size)
+    skip = hk.Linear(self.out_size)
+
+    bias_mat = (adj - 1.0) * 1e9
+
+    a_1 = hk.Linear(1)
+    a_2 = hk.Linear(1)
+    a_e = hk.Linear(1)
+    a_g = hk.Linear(1)
+
+    values = m(hidden)
+
+    att_1 = a_1(hidden)
+    att_2 = a_2(hidden)
+    att_e = a_e(e_features)
+    att_g = a_g(g_features)
+
+    logits = (
+        att_1 + jnp.transpose(att_2, (0, 2, 1)) + jnp.squeeze(att_e, axis=-1) +
+        jnp.expand_dims(att_g, axis=-1))
+    coefs = jax.nn.softmax(jax.nn.leaky_relu(logits) + bias_mat, axis=-1)
+    ret = jnp.matmul(coefs, values)
+
+    if self.residual:
+      ret += skip(hidden)
+
+    if self.activation is not None:
+      ret = self.activation(ret)
+
+    return ret
+  
   def __call__(
       self,
       hidden: _Array,
@@ -115,42 +168,10 @@ class GAT(Processor):
     Returns:
       Output of GAT inference step.
     """
-    features = jnp.concatenate([n_features, hidden], axis=-1)
-    b, n, _ = features.shape
-    assert e_features.shape[:-1] == (b, n, n)
-    assert g_features.shape[:-1] == (b,)
-    assert adj.shape == (b, n, n)
-
-    m = hk.Linear(self.out_size)
-    skip = hk.Linear(self.out_size)
-
-    bias_mat = (adj - 1.0) * 1e9
-
-    a_1 = hk.Linear(1)
-    a_2 = hk.Linear(1)
-    a_e = hk.Linear(1)
-    a_g = hk.Linear(1)
-
-    values = m(features)
-
-    att_1 = a_1(features)
-    att_2 = a_2(features)
-    att_e = a_e(e_features)
-    att_g = a_g(g_features)
-
-    logits = (
-        att_1 + jnp.transpose(att_2, (0, 2, 1)) + jnp.squeeze(att_e, axis=-1) +
-        jnp.expand_dims(att_g, axis=-1))
-    coefs = jax.nn.softmax(jax.nn.leaky_relu(logits) + bias_mat, axis=-1)
-    ret = jnp.matmul(coefs, values)
-
-    if self.residual:
-      ret += skip(features)
-
-    if self.activation is not None:
-      ret = self.activation(ret)
-
-    return ret
+    hidden_map = {'n_features': n_features, 'hidden': hidden, 'zeros': jnp.zeros_like(hidden)}
+    hidden_input = self.hidden_input["first_step"] if first_step else self.hidden_input["nth_step"]
+    features = jnp.concatenate([hidden_map[i] for i in hidden_input], axis=-1)
+    return self.step(features, e_features, g_features, adj)
 
   def preprocess_adjmat(self, adj_mat: _Array) -> _Array:
       return jnp.ones_like(adj_mat)
@@ -162,6 +183,7 @@ class GAT(Processor):
         nb_heads=model_params["nb_heads"],
         activation=model_params["activation"],
         residual=model_params["residual"],
+        hidden_input=model_params["hidden_input"],
       )
     
 class MPNN(Processor):
@@ -176,6 +198,7 @@ class MPNN(Processor):
       reduction: _Fn = jnp.max,
       msgs_mlp_sizes: Optional[List[int]] = None,
       name: str = 'mpnn_aggr',
+      hidden_input: Dict[str, List[str]] = DEFAULT_HIDDEN_INPUT,
   ):
     super().__init__(name=name)
     if mid_size is None:
@@ -187,6 +210,57 @@ class MPNN(Processor):
     self.activation = activation
     self.reduction = reduction
     self._msgs_mlp_sizes = msgs_mlp_sizes
+    self.hidden_input = hidden_input
+
+  def step(
+    self,
+    hidden: _Array,
+    e_features: _Array,
+    g_features: _Array,
+    adj: _Array
+  ) -> _Array:
+    b, n, _ = hidden.shape
+    assert e_features.shape[:-1] == (b, n, n)
+    assert g_features.shape[:-1] == (b,)
+    assert adj.shape == (b, n, n)
+
+    m_1 = hk.Linear(self.mid_size)
+    m_2 = hk.Linear(self.mid_size)
+    m_e = hk.Linear(self.mid_size)
+    m_g = hk.Linear(self.mid_size)
+
+    o1 = hk.Linear(self.out_size)
+    o2 = hk.Linear(self.out_size)
+
+    msg_1 = m_1(hidden)
+    msg_2 = m_2(hidden)
+    msg_e = m_e(e_features)
+    msg_g = m_g(g_features)
+
+    msgs = (
+        jnp.expand_dims(msg_1, axis=1) + jnp.expand_dims(msg_2, axis=2) +
+        msg_e + jnp.expand_dims(msg_g, axis=(1, 2)))
+    if self._msgs_mlp_sizes is not None:
+      msgs = hk.nets.MLP(self._msgs_mlp_sizes)(jax.nn.relu(msgs))
+
+    if self.mid_act is not None:
+      msgs = self.mid_act(msgs)
+
+    if self.reduction == jnp.mean:
+      msgs = jnp.sum(msgs * jnp.expand_dims(adj, -1), axis=-1)
+      msgs = msgs / jnp.sum(adj, axis=-1, keepdims=True)
+    else:
+      msgs = self.reduction(msgs * jnp.expand_dims(adj, -1), axis=1)
+
+    h_1 = o1(hidden)
+    h_2 = o2(msgs)
+
+    ret = h_1 + h_2
+
+    if self.activation is not None:
+      ret = self.activation(ret)
+
+    return ret
 
   def __call__(
       self,
@@ -208,49 +282,10 @@ class MPNN(Processor):
     Returns:
       Output of MPNN inference step.
     """
-    features = jnp.concatenate([n_features, hidden], axis=-1)
-    b, n, _ = features.shape
-    assert e_features.shape[:-1] == (b, n, n)
-    assert g_features.shape[:-1] == (b,)
-    assert adj.shape == (b, n, n)
-
-    m_1 = hk.Linear(self.mid_size)
-    m_2 = hk.Linear(self.mid_size)
-    m_e = hk.Linear(self.mid_size)
-    m_g = hk.Linear(self.mid_size)
-
-    o1 = hk.Linear(self.out_size)
-    o2 = hk.Linear(self.out_size)
-
-    msg_1 = m_1(features)
-    msg_2 = m_2(features)
-    msg_e = m_e(e_features)
-    msg_g = m_g(g_features)
-
-    msgs = (
-        jnp.expand_dims(msg_1, axis=1) + jnp.expand_dims(msg_2, axis=2) +
-        msg_e + jnp.expand_dims(msg_g, axis=(1, 2)))
-    if self._msgs_mlp_sizes is not None:
-      msgs = hk.nets.MLP(self._msgs_mlp_sizes)(jax.nn.relu(msgs))
-
-    if self.mid_act is not None:
-      msgs = self.mid_act(msgs)
-
-    if self.reduction == jnp.mean:
-      msgs = jnp.sum(msgs * jnp.expand_dims(adj, -1), axis=-1)
-      msgs = msgs / jnp.sum(adj, axis=-1, keepdims=True)
-    else:
-      msgs = self.reduction(msgs * jnp.expand_dims(adj, -1), axis=1)
-
-    h_1 = o1(features)
-    h_2 = o2(msgs)
-
-    ret = h_1 + h_2
-
-    if self.activation is not None:
-      ret = self.activation(ret)
-
-    return ret
+    hidden_map = {'n_features': n_features, 'hidden': hidden, 'zeros': jnp.zeros_like(hidden)}
+    hidden_input = self.hidden_input["first_step"] if first_step else self.hidden_input["nth_step"]
+    features = jnp.concatenate([hidden_map[i] for i in hidden_input], axis=-1)
+    return self.step(features, e_features, g_features, adj)
 
   def preprocess_adjmat(self, adj_mat: _Array) -> _Array:
       return jnp.ones_like(adj_mat)
@@ -263,6 +298,7 @@ class MPNN(Processor):
         activation=model_params["activation"],
         reduction=model_params["reduction"],
         msgs_mlp_sizes=model_params["msgs_mlp_sizes"],
+        hidden_input=model_params["hidden_input"],
       )
 
 class PGN(MPNN):
@@ -283,7 +319,8 @@ class PGN(MPNN):
         activation=model_params["activation"],
         reduction=model_params["reduction"],
         msgs_mlp_sizes=model_params["msgs_mlp_sizes"],
-        pgn_mask=model_params["pgn_mask"]
+        hidden_input=model_params["hidden_input"],
+        pgn_mask=model_params["pgn_mask"],
       )
 
 class DeepSets(MPNN):
@@ -300,4 +337,5 @@ class DeepSets(MPNN):
         activation=model_params["activation"],
         reduction=model_params["reduction"],
         msgs_mlp_sizes=model_params["msgs_mlp_sizes"],
+        hidden_input=model_params["hidden_input"],
       )
