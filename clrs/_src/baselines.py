@@ -489,7 +489,7 @@ class Net(hk.Module):
       e_pred_2 = self.edge_dec_diff[1](h_t)
       e_pred_e = self.edge_dec_diff[2](edge_fts)
       diff_preds[_Location.EDGE] = jnp.squeeze(
-          jnp.expand_dims(e_pred_1, -1) + jnp.expand_dims(e_pred_2, -1) +
+          jnp.expand_dims(e_pred_1, -1) + jnp.expand_dims(e_pred_2, -2) +
           e_pred_e, -1)
       gr_emb = jnp.max(h_t, axis=-2)
       g_pred_n = self.graph_dec_diff[0](gr_emb)
