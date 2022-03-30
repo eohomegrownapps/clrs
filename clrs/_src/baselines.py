@@ -110,7 +110,7 @@ class Net(hk.Module):
                         nb_nodes: int,
                         inputs: _Trajectory,
                         first_step: bool = False):
-    if (not first_step) and repred: #and self.decode_hints:
+    if (not first_step) and repred:
       decoded_hint = _decode_from_preds(self.spec, mp_state.hint_preds)
       cur_hint = []
       for hint in decoded_hint:
@@ -118,6 +118,7 @@ class Net(hk.Module):
     else:
       cur_hint = []
       for hint in hints:
+        hint.data = jnp.asarray(hint.data)
         _, loc, typ = self.spec[hint.name]
         cur_hint.append(
             probing.DataPoint(
