@@ -768,17 +768,17 @@ class BaselineModel(model.Model):
                     (pred - truth.data[i + 1])**2 * is_not_done)
             elif truth.type_ == _Type.MASK:
               if self.decode_diffs:
-                loss = jnp.mean(
+                loss = (
                     jnp.maximum(pred, 0) - pred * truth.data[i + 1] +
                     jnp.log1p(jnp.exp(-jnp.abs(pred))) *
                     gt_diffs[i][truth.location] * is_not_done)
               else:
-                loss = jnp.mean(
+                loss = (
                     jnp.maximum(pred, 0) - pred * truth.data[i + 1] +
                     jnp.log1p(jnp.exp(-jnp.abs(pred))) * is_not_done)
-              mask = (truth.data != _OutputClass.MASKED.value).astype(
+              mask = (truth.data[i + 1] != _OutputClass.MASKED.value).astype(
                   jnp.float32)
-              total_loss += jnp.sum(loss*mask)/jnp.sum(mask)
+              total_loss += jnp.sum(loss*mask)/jnp.maximum(jnp.sum(mask), EPS)
             elif truth.type_ == _Type.MASK_ONE:
               if self.decode_diffs:
                 total_loss += jnp.mean(
