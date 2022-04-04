@@ -28,15 +28,19 @@ from clrs._src import probing
 from clrs._src import processors
 from clrs._src import samplers
 from clrs._src import specs
+from clrs._src.encoders import IntEncoder
 
 import haiku as hk
 import jax
 import jax.numpy as jnp
 import optax
 
+import numpy as np
+
 
 _BIG_NUMBER = 1e5
 EPS = 1e-12
+N_BITS = 8
 
 _Array = chex.Array
 _DataPoint = probing.DataPoint
@@ -355,6 +359,8 @@ class Net(hk.Module):
           else:
             raise ValueError('Incorrect location')
 
+    self.enc_inp["intencoder"] = [IntEncoder(N_BITS, self.hidden_dim)]
+
   def _construct_processor(self):
     """Constructs processor."""
     if self.kind is None:
@@ -394,6 +400,15 @@ class Net(hk.Module):
         jnp.expand_dims(jnp.eye(nb_nodes), 0), self.batch_size, axis=0)
 
     for inp in inputs:
+      if inp.name == "pos":
+        # Random binary positional encoding
+        encoder = self.enc_inp["intencoder"][0]
+        batch_size = inp.data.shape[-2]
+        n_nodes = inp.data.shape[-1]
+        idxs = np.random.rand(batch_size, 1 << N_BITS).argpartition(n_nodes,axis=1)[:,:n_nodes]
+        node_fts += encoder(idxs)
+        continue
+
       # Extract shared logic with hints and loss
       encoder = self.enc_inp[inp.name][0]
       if inp.type_ == _Type.POINTER:
