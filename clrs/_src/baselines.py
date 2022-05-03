@@ -530,12 +530,18 @@ class Net(hk.Module):
           elif hint.type_ == _Type.CATEGORICAL:
             hint_preds[hint.name] = decoders[0](h_t)
           elif hint.type_ == _Type.POINTER:
+            """
             p_1 = decoders[0](h_t)
             p_2 = decoders[1](h_t)
             ptr_p = jnp.matmul(p_1, jnp.transpose(p_2, (0, 2, 1)))
             hint_preds[hint.name] = ptr_p
             if self.inf_bias:
               hint_preds[hint.name] -= (1 - adj_mat) * _BIG_NUMBER
+            """
+            p_1 = decoders[0](h_t)
+            p_2 = decoders[1](h_t)
+            p_3 = decoders[2](edge_fts)
+            hint_preds[hint.name] = p_1 + jnp.transpose(p_2, (0, 2, 1)) + jnp.squeeze(p_3)
           else:
             raise ValueError('Invalid hint type')
         elif hint.location == _Location.EDGE:
@@ -591,12 +597,18 @@ class Net(hk.Module):
         elif out_type == _Type.CATEGORICAL:
           output_preds[out_name] = decoders[0](h_t)
         elif out_type == _Type.POINTER:
+          """
           p_1 = decoders[0](h_t)
           p_2 = decoders[1](h_t)
           ptr_p = jnp.matmul(p_1, jnp.transpose(p_2, (0, 2, 1)))
           output_preds[out_name] = ptr_p
           if self.inf_bias:
             output_preds[out_name] -= (1 - adj_mat) * _BIG_NUMBER
+          """
+          p_1 = decoders[0](h_t)
+          p_2 = decoders[1](h_t)
+          p_3 = decoders[2](edge_fts)
+          output_preds[out_name] = p_1 + jnp.transpose(p_2, (0, 2, 1)) + jnp.squeeze(p_3)
         else:
           raise ValueError('Invalid output type')
       elif out_location == _Location.EDGE:

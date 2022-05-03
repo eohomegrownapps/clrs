@@ -169,6 +169,9 @@ class Sampler(abc.ABC):
       mat = mat[p, :][:, p]
     if weighted:
       weights = self._rng.uniform(low=low, high=high, size=(nb_nodes, nb_nodes))
+      if not directed:
+        weights *= np.transpose(weights)
+        weights = np.sqrt(weights + 1e-3)  # Add epsilon to protect underflow
       mat = mat.astype(float) * weights
     return mat
 
